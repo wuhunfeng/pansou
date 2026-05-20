@@ -1,16 +1,21 @@
 name: Build Pansou
-on: [push]
+on: 
+  push:
+  workflow_dispatch: # 这一行非常重要，加上后Actions页面会出现“Run workflow”按钮
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.20' # 锁定版本为 1.20，避免sonic库的编译错误
-      - run: go mod tidy
-      - run: GOOS=linux GOARCH=amd64 go build -o pansou main.go
-      - uses: actions/upload-artifact@v4
+          go-version: '1.22'
+      - name: Build
+        run: GOOS=linux GOARCH=amd64 go build -v -o pansou main.go
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: pansou-linux
+          name: pansou-binary
           path: pansou

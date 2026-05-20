@@ -1,5 +1,7 @@
 name: Build Pansou
-on: [push]
+on: 
+  push:
+  workflow_dispatch: # 这一行非常重要，加上后Actions页面会出现“Run workflow”按钮
 
 jobs:
   build:
@@ -15,5 +17,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pansou-linux
+          name: pansou-binary
           path: pansou

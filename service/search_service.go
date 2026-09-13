@@ -1092,10 +1092,13 @@ func mergeResultsByType(results []model.SearchResult, keyword string, cloudTypes
 				}
 			}
 
-			// 关键词过滤：现在我们有了准确的链接-标题对应关系，只需检查每个链接的具体标题
+			// 关键词过滤：插件结果依赖链接标题；Telegram 结果已经经过
+			// t.me/s 的服务端搜索，关键词也可能只出现在简介/正文中，
+			// 不能因为标题字段被日期、格式名或另一作品覆盖而丢弃。
 			if !skipKeywordFilter && keyword != "" {
-				// 只检查链接的具体标题，无论是TG来源还是插件来源
-				if !strings.Contains(strings.ToLower(title), lowerKeyword) {
+				titleMatched := strings.Contains(strings.ToLower(title), lowerKeyword)
+				contentMatched := result.Channel != "" && strings.Contains(strings.ToLower(result.Content), lowerKeyword)
+				if !titleMatched && !contentMatched {
 					continue
 				}
 			}
@@ -1377,11 +1380,9 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 			plugin.SetMainCacheKey(cacheKey)
 			plugin.SetCurrentKeyword(keyword)
 
-			// 调用异步插件的AsyncSearch方法
-			results, err := plugin.AsyncSearch(keyword, func(client *http.Client, kw string, extParams map[string]interface{}) ([]model.SearchResult, error) {
-				// 使用插件的Search方法作为搜索函数
-				return plugin.Search(kw, extParams)
-			}, cacheKey, ext)
+			// 插件的Search方法已经负责异步调度、插件缓存和后台刷新。
+			// 这里直接调用，避免再包一层AsyncSearch导致嵌套等待和重复超时。
+			results, err := plugin.Search(keyword, ext)
 
 			if err != nil {
 				return nil

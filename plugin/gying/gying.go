@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,6 +34,7 @@ import (
 	"pansou/util/json"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/idna"
 	"golang.org/x/net/proxy"
 
 	cloudscraper "github.com/Advik-B/cloudscraper/lib"
@@ -40,21 +42,27 @@ import (
 
 // 插件配置参数
 const (
-	MaxConcurrentUsers   = 10   // 最多使用的用户数
-	MaxConcurrentDetails = 50   // 最大并发详情请求数
+	MaxConcurrentUsers   = 10    // 最多使用的用户数
+	MaxConcurrentDetails = 50    // 最大并发详情请求数
 	DebugLog             = false // 调试日志开关（排查问题时改为true）
 )
 
 // 默认账户配置（可通过Web界面添加更多账户）
 // 用户数据会保存到文件，重启后自动恢复
 const (
-	DefaultGyingBaseURL = "https://www.gying.net"
+	DefaultGyingBaseURL = "https://www.xn--wcv59z.com"
 	GyingConfigFileName = "gying_config.json"
 )
 
+var legacyGyingHosts = map[string]struct{}{
+	"gying.net":      {},
+	"www.gying.net":  {},
+	"xn--wcv59z.com": {},
+}
+
 var (
-	challengeJSONPattern  = regexp.MustCompile(`const json=(\{.*?\});const jss=`)
-	searchDataPattern     = regexp.MustCompile(`_obj\.search=(\{.*?\});`)
+	challengeJSONPattern  = regexp.MustCompile(`(?s)const\s+json\s*=\s*(\{.*?\})\s*;\s*const\s+jss\s*=`)
+	searchDataPattern     = regexp.MustCompile(`(?s)_obj\s*\.\s*search\s*=\s*(\{.*?\})\s*;`)
 	accessCodeBlockRegex  = regexp.MustCompile(`[（(]\s*访问码[:：]\s*[^)）]+[)）]`)
 	yearSuffixRegex       = regexp.MustCompile(`[（(]\d{4}[)）]`)
 	baiduLinkRegex        = regexp.MustCompile(`https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(?:\?pwd=[a-zA-Z0-9]{4})?`)
@@ -243,7 +251,7 @@ const HTMLTemplate = `<!DOCTYPE html>
 
             <div class="form-group">
                 <label>站点地址</label>
-                <input type="text" id="base-url" placeholder="例如: https://www.gying.net">
+                <input type="text" id="base-url" placeholder="例如: https://www.教父.com">
             </div>
             <button class="btn btn-primary" onclick="saveBaseURL()">保存站点地址</button>
             <p style="margin-top: 10px; font-size: 12px; color: #666;">
@@ -560,6 +568,9 @@ type ChallengePageData struct {
 	Challenge []string `json:"challenge"`
 	Diff      int      `json:"diff"`
 	Salt      string   `json:"salt"`
+	N         string   `json:"N"`
+	X         string   `json:"x"`
+	T         int      `json:"t"`
 }
 
 type challengeVerifyResponse struct {
@@ -607,7 +618,26 @@ func normalizeBaseURL(raw string) (string, error) {
 		return "", fmt.Errorf("站点地址不能包含路径")
 	}
 
-	return parsed.Scheme + "://" + parsed.Host, nil
+	// HTTP clients do not consistently convert Unicode hostnames to IDNA.
+	// Store the ASCII form so both the config page and requests are reliable.
+	hostname, err := idna.Lookup.ToASCII(parsed.Hostname())
+	if err != nil {
+		return "", fmt.Errorf("站点域名格式错误: %v", err)
+	}
+	host := hostname
+	if port := parsed.Port(); port != "" {
+		host += ":" + port
+	}
+	return parsed.Scheme + "://" + host, nil
+}
+
+func isLegacyGyingBaseURL(baseURL string) bool {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	_, ok := legacyGyingHosts[strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))]
+	return ok
 }
 
 func (p *GyingPlugin) configPath() string {
@@ -664,6 +694,12 @@ func (p *GyingPlugin) loadConfig() error {
 	baseURL, err := normalizeBaseURL(config.BaseURL)
 	if err != nil {
 		return err
+	}
+	if isLegacyGyingBaseURL(baseURL) {
+		baseURL = DefaultGyingBaseURL
+		if err := p.saveConfig(baseURL); err != nil {
+			return fmt.Errorf("迁移旧站点配置失败: %w", err)
+		}
 	}
 	p.setBaseURL(baseURL)
 	return nil
@@ -1462,14 +1498,19 @@ func isBotChallengePage(body []byte) bool {
 		return false
 	}
 	bodyText := string(body)
-	if !challengeJSONPattern.Match(body) {
-		return false
-	}
-
-	return strings.Contains(bodyText, "正在确认你是不是机器人") ||
+	hasVerifyText := strings.Contains(bodyText, "正在确认你是不是机器人") ||
 		strings.Contains(bodyText, "浏览器安全验证") ||
 		strings.Contains(bodyText, "安全验证") ||
 		strings.Contains(bodyText, "正在进行浏览器计算验证")
+	if !hasVerifyText {
+		return false
+	}
+
+	return challengeJSONPattern.Match(body) ||
+		strings.Contains(bodyText, "powSolve-") ||
+		strings.Contains(bodyText, "pow.worker-") ||
+		strings.Contains(bodyText, "const jss=") ||
+		strings.Contains(bodyText, "/res/pow")
 }
 
 func isLoginShell(body []byte) bool {
@@ -1616,13 +1657,122 @@ func (p *GyingPlugin) applyProxyToScraper(scraper *cloudscraper.Scraper) error {
 func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestURL string, body []byte) error {
 	matches := challengeJSONPattern.FindSubmatch(body)
 	if len(matches) < 2 {
-		return fmt.Errorf("未找到验证数据")
+		return p.solveRemotePowChallenge(scraper, requestURL)
 	}
 
 	var challenge ChallengePageData
 	if err := json.Unmarshal(matches[1], &challenge); err != nil {
 		return fmt.Errorf("解析验证数据失败: %w", err)
 	}
+
+	if challenge.ID != "" && challenge.N != "" && challenge.X != "" && challenge.T > 0 {
+		return p.solvePowChallenge(scraper, requestURL, &challenge)
+	}
+
+	return p.solveLegacyHashChallenge(scraper, requestURL, &challenge)
+}
+
+func (p *GyingPlugin) solveRemotePowChallenge(scraper *cloudscraper.Scraper, requestURL string) error {
+	powURL, err := p.buildPowURL(requestURL)
+	if err != nil {
+		return err
+	}
+
+	if DebugLog {
+		fmt.Printf("[Gying] Remote PoW Challenge命中: url=%s powURL=%s\n", requestURL, powURL)
+	}
+
+	body, statusCode, _, err := p.requestWithChallengeRetry(scraper, http.MethodGet, powURL, "", "")
+	if err != nil {
+		return fmt.Errorf("获取PoW验证数据失败: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return fmt.Errorf("获取PoW验证数据失败: HTTP %d", statusCode)
+	}
+
+	var challenge ChallengePageData
+	if err := json.Unmarshal(body, &challenge); err != nil {
+		return fmt.Errorf("解析PoW验证数据失败: %w", err)
+	}
+	if challenge.N == "" || challenge.X == "" || challenge.T <= 0 {
+		return fmt.Errorf("PoW验证数据无效")
+	}
+
+	y, err := p.computePowResult(&challenge)
+	if err != nil {
+		return err
+	}
+
+	form := url.Values{}
+	form.Set("y", y)
+
+	return p.submitChallengeVerification(scraper, powURL, form)
+}
+
+func (p *GyingPlugin) buildPowURL(requestURL string) (string, error) {
+	parsedURL, err := url.Parse(requestURL)
+	if err != nil {
+		return "", fmt.Errorf("解析验证URL失败: %w", err)
+	}
+	parsedURL.Path = "/res/pow"
+	parsedURL.RawQuery = ""
+	parsedURL.Fragment = ""
+	return parsedURL.String(), nil
+}
+
+func (p *GyingPlugin) solvePowChallenge(scraper *cloudscraper.Scraper, requestURL string, challenge *ChallengePageData) error {
+	y, err := p.computePowResult(challenge)
+	if err != nil {
+		return err
+	}
+
+	form := url.Values{}
+	form.Set("action", "verify")
+	form.Set("id", challenge.ID)
+	form.Set("y", y)
+
+	return p.submitChallengeVerification(scraper, requestURL, form)
+}
+
+func (p *GyingPlugin) computePowResult(challenge *ChallengePageData) (string, error) {
+	modulus, ok := new(big.Int).SetString(challenge.N, 16)
+	if !ok || modulus.Sign() <= 0 {
+		return "", fmt.Errorf("PoW验证数据无效: N")
+	}
+
+	y, ok := new(big.Int).SetString(challenge.X, 16)
+	if !ok || y.Sign() < 0 {
+		return "", fmt.Errorf("PoW验证数据无效: x")
+	}
+	if challenge.T <= 0 {
+		return "", fmt.Errorf("PoW验证数据无效: t")
+	}
+
+	if DebugLog {
+		fmt.Printf("[Gying] PoW Challenge计算开始: id=%s t=%d nBits=%d\n",
+			challenge.ID, challenge.T, modulus.BitLen())
+	}
+
+	start := time.Now()
+	for i := 0; i < challenge.T; i++ {
+		y.Mul(y, y)
+		y.Mod(y, modulus)
+	}
+	elapsed := time.Since(start)
+
+	if DebugLog {
+		fmt.Printf("[Gying] PoW Challenge计算完成: id=%s t=%d cost=%s\n",
+			challenge.ID, challenge.T, elapsed.Round(time.Millisecond))
+	}
+
+	if minSolveTime := 3 * time.Second; elapsed < minSolveTime {
+		time.Sleep(minSolveTime - elapsed)
+	}
+
+	return y.Text(16), nil
+}
+
+func (p *GyingPlugin) solveLegacyHashChallenge(scraper *cloudscraper.Scraper, requestURL string, challenge *ChallengePageData) error {
 	if challenge.ID == "" || challenge.Salt == "" || challenge.Diff <= 0 || len(challenge.Challenge) == 0 {
 		return fmt.Errorf("验证数据无效")
 	}
@@ -1711,6 +1861,10 @@ func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestUR
 		form.Add("nonce[]", strconv.Itoa(nonce))
 	}
 
+	return p.submitChallengeVerification(scraper, requestURL, form)
+}
+
+func (p *GyingPlugin) submitChallengeVerification(scraper *cloudscraper.Scraper, requestURL string, form url.Values) error {
 	resp, err := scraper.Post(requestURL, "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
 	if err != nil {
 		return fmt.Errorf("提交验证失败: %w", err)

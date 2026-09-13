@@ -314,6 +314,14 @@ curl -X POST "http://localhost:8888/gying/{hash}" \
 
 插件会进入 `solveBotChallenge` 自动求解后再重试原请求。
 
+当前同时兼容三类验证结构：
+
+- 远程 PoW：验证页只加载 `powSolve-*.js`，并通过 `Set-Cookie: browser_pow=...` 标记挑战；插件请求 `{base_url}/res/pow` 获取 `N/x/t`，计算后 `POST {base_url}/res/pow` 提交 `y`。
+- 内嵌 PoW：`const json={id,N,x,t};const jss=...`，插件用 Go 的 `math/big` 直接计算 `y = y*y % N` 共 `t` 次，然后提交 `action=verify&id={id}&y={y}`。
+- 旧版哈希枚举：`const json={id,challenge,diff,salt};const jss=...`，插件枚举 `nonce`，匹配 `sha256(strconv.Itoa(nonce)+salt)` 后提交 `nonce[]`。
+
+PoW 求解不依赖 Playwright、Puppeteer、Selenium 或真实浏览器环境；它是对站点 worker 脚本的轻量算法复现。为贴近前端行为，计算完成不足 3 秒时会补齐等待后再提交验证。
+
 验证通过后，站点通常会下发 `browser_verified` 这类验证态 Cookie。当前插件会：
 
 - 在登录阶段导出并保存当前 Cookie 快照
@@ -340,6 +348,57 @@ curl -X POST "http://localhost:8888/gying/{hash}" \
 1. 使用错误密码登录，应能通过 challenge 并返回站点的账号密码错误 JSON，而不是停在机器人验证页。
 2. 使用正确密码登录，应返回 `登录成功`，并在 Cookie 快照中包含 `PHPSESSID`、`app_auth`、`browser_verified`。
 3. 调用 `test_search` 搜索关键词，应能访问搜索页和详情接口并返回网盘链接。
+
+#### 1.2 2026-05 新版 PoW 参数变更
+
+新版验证页不再只返回 `challenge/diff/salt`，而是返回类似：
+
+```javascript
+const json={"id":"...","N":"...","x":"...","t":800000};const jss={...};
+```
+
+对应的 worker 逻辑等价于：
+
+```text
+N = BigInt("0x" + json.N)
+y = BigInt("0x" + json.x)
+repeat json.t times:
+    y = (y * y) % N
+```
+
+验证提交表单为：
+
+```text
+action=verify&id={id}&y={hex(y)}
+```
+
+此前代码只识别旧版 `challenge/diff/salt`，会在登录或搜索进入新版验证页时报 `验证数据无效`。当前实现已在 `solveBotChallenge` 中自动分流新版 PoW 和旧版哈希枚举。
+
+因为新版验证会增加登录耗时，配套前端 `pansou-web` 也把 Gying 登录 / 测试搜索请求超时放宽，并在登录请求超时后回查一次状态，避免后端已登录成功但前端误报“登录失败”。
+
+#### 1.3 2026-05 远程 PoW 流程
+
+站点后来又调整为“页面不再内嵌 `const json`”的流程。验证页只包含：
+
+```javascript
+const jss={"worker":"//static.filejin.ru/static/file/js/pow.worker-...js"};
+```
+
+同时响应头下发：
+
+```text
+Set-Cookie: browser_pow={challenge_id}; Max-Age=300; HttpOnly; SameSite=Lax
+```
+
+前端脚本的真实流程是：
+
+1. `GET /res/pow` 获取 `N/x/t`
+2. 本地计算 `y = y*y % N` 共 `t` 次
+3. `POST /res/pow`，表单为 `y={hex(y)}`
+4. 成功后服务端返回 `{"success":true,"challenge_id":"..."}` 并下发 `browser_verified`
+5. 原请求重新加载
+
+当前插件在识别到这类验证页时，会自动走 `solveRemotePowChallenge`，用同一个 `cloudscraper` 会话完成 `/res/pow` 获取、计算、提交，再重试搜索或详情请求。
 
 ### 2. 搜索链路不是单接口
 

@@ -2,17 +2,19 @@
 
 PanSou是一个高性能的网盘资源搜索API服务，支持TG搜索和自定义插件搜索。系统设计以性能和可扩展性为核心，支持并发搜索、结果智能排序和网盘类型分类。
 
-[//]: # (MCP服务文档: [MCP-SERVICE.md]&#40;docs/MCP-SERVICE.md&#41;)
-
-
 ## 特性（[详见系统设计文档](docs/%E7%B3%BB%E7%BB%9F%E5%BC%80%E5%8F%91%E8%AE%BE%E8%AE%A1%E6%96%87%E6%A1%A3.md)）
 
 - **高性能搜索**：并发执行多个TG频道及异步插件搜索，显著提升搜索速度；工作池设计，高效管理并发任务
 - **网盘类型分类**：自动识别多种网盘链接，按类型归类展示
 - **智能排序**：基于插件等级、时间新鲜度和优先关键词的多维度综合排序算法
-- **异步插件系统**：支持通过插件扩展搜索来源，支持"尽快响应，持续处理"的异步搜索模式，解决了某些搜索源响应时间长的问题。详情参考[**插件开发指南**](docs/插件开发指南.md)
+- **异步插件系统**：支持通过插件扩展搜索来源，支持"尽快响应，持续处理"的异步搜索模式，解决了某些搜索源响应时间长的问题。详情参考[**插件开发指南**](docs/插件开发指南.md)，AI 辅助开发可参考[**PanSou 插件开发 Skill 使用说明**](docs/AI客户端使用PanSou插件开发Skill指南.md)
 - **二级缓存**：分片内存+分片磁盘缓存机制，大幅提升重复查询速度和并发性能  
 
+## 开发者文档
+
+- [插件开发指南](docs/插件开发指南.md)：PanSou 插件接口、异步机制、优先级、过滤策略和开发流程。
+- [PanSou 插件开发 Skill 使用说明](docs/AI客户端使用PanSou插件开发Skill指南.md)：在 Codex、Claude、Cursor、Windsurf、Copilot Chat、Cline/Roo Code 等 AI 客户端中复用插件开发规则。
+- [PanSou 插件开发 Skill 原文](docs/pansou-plugin-developer-SKILL.md)：可直接安装到支持 Skill 的客户端，或作为项目规则引用。
 
 ## 支持的网盘类型
 
@@ -606,7 +608,17 @@ curl "http://localhost:8888/api/search?kw=唐朝诡事录&filter=%7B%22include%2
 | items[].disk_type | string | 是 | 网盘类型，支持：baidu、aliyun、quark、tianyi、uc、mobile、115、xunlei、123 |
 | items[].url | string | 是 | 完整分享链接 |
 | items[].password | string | 否 | 提取码/密码，未拼接在链接中时可传 |
+| proxy_url | string | 否 | 本次检测请求使用的代理地址，位于请求根节点，支持 `http://`、`https://`、`socks5://`、`socks5h://` |
+| proxy | string | 否 | `proxy_url` 的兼容别名，位于请求根节点；同时传入时以 `proxy_url` 为准 |
 | view_token | string | 否 | 视图标识，用于区分当前前端检测批次 |
+
+**代理行为说明**：
+
+- `proxy_url`/`proxy` 只影响当前 `/api/check/links` 请求，不会修改服务进程的全局代理配置。
+- 单次批量检测共用同一个代理；如需轮换出口IP，可由调用方在不同请求中传入不同代理。
+- 未传 `proxy_url`/`proxy` 时，检测服务沿用启动时的全局HTTP客户端配置。
+- 使用代理时，检测缓存会按代理地址隔离，避免不同出口IP复用同一检测结果。
+- 代理地址格式非法或协议不支持时返回 `400`，不会静默降级为直连。
 
 **请求示例**：
 
@@ -631,6 +643,19 @@ curl -X POST http://localhost:8888/api/check/links \
       }
     ],
     "view_token": "quark-1710000000000"
+  }'
+
+# 指定本次检测使用代理，避免固定出口IP频繁触发风控
+curl -X POST http://localhost:8888/api/check/links \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [
+      {
+        "disk_type": "quark",
+        "url": "https://pan.quark.cn/s/abcdefg"
+      }
+    ],
+    "proxy_url": "socks5://127.0.0.1:1080"
   }'
 
 # 启用认证时
@@ -711,6 +736,12 @@ curl -X POST http://localhost:8888/api/check/links \
   "message": "items不能为空"
 }
 
+// 代理参数无效
+{
+  "code": 400,
+  "message": "无效的代理参数: 不支持的代理协议: ftp"
+}
+
 // 未授权（启用认证但未提供Token）
 {
   "error": "未授权：缺少认证令牌",
@@ -781,4 +812,4 @@ curl http://localhost:8888/api/health
 
 ## ⭐ Star 历史
 
-[![Star History Chart](https://api.star-history.com/svg?repos=fish2018/pansou&type=Date)](https://star-history.com/#fish2018/pansou&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=fish2018/pansou&type=Date)](https://star-history.dera.page/#fish2018/pansou&Date)

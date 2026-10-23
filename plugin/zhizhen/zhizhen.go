@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/util"
 	"regexp"
 	"strings"
 	"sync"
@@ -17,9 +18,11 @@ import (
 )
 
 const (
-	// 默认超时时间 - 优化为更短时间
-	DefaultTimeout = 8 * time.Second
-	DetailTimeout  = 6 * time.Second
+	// 站点 2026-10 换到"花卷"模板后回源明显变慢：实测搜索页 1.9~17.8s、
+	// 详情页 6.8~14.2s（Cloudflare 回源，且波动很大）。原先 8s/6s 的超时
+	// 几乎每次都在传输完成前截断，于是"请求成功但一条都解析不出来"。
+	DefaultTimeout = 25 * time.Second
+	DetailTimeout  = 25 * time.Second
 
 	// 并发数限制 - 大幅提高并发数
 	MaxConcurrency = 20
@@ -35,9 +38,11 @@ const (
 )
 
 var sourceURLs = []string{
-	"http://www.miqk.cc",
-	"https://mihdr.top",
-	"https://www.mihdr.top",
+	// 站点在 2026-10 迁到"花卷"模板：旧域名 miqk.cc 已无解析，mihdr.top（不带 www）
+	// 也没有 A 记录了。幸存入口只有 http://www.mihdr.top，且它的 HTTPS 在
+	// Cloudflare 侧直接握手失败（sslv3 alert handshake failure），HTTP 才返回页面，
+	// 所以这里必须写 http，顺手改成 https 会让整站不可用。
+	"http://www.mihdr.top",
 }
 
 // 性能统计（原子操作）
@@ -92,6 +97,7 @@ type ZhizhenAsyncPlugin struct {
 // createOptimizedHTTPClient 创建优化的HTTP客户端
 func createOptimizedHTTPClient() *http.Client {
 	transport := &http.Transport{
+		Proxy:               util.ProxyFuncForTransport(),
 		MaxIdleConns:        MaxIdleConns,
 		MaxIdleConnsPerHost: MaxIdleConnsPerHost,
 		MaxConnsPerHost:     MaxConnsPerHost,
@@ -502,7 +508,14 @@ func (p *ZhizhenAsyncPlugin) doRequestWithRetry(req *http.Request, client *http.
 		}
 
 		if resp != nil {
+			status := resp.StatusCode
 			resp.Body.Close()
+			if err == nil {
+				// Do 成功但状态码非 200。此前这里只执行 lastErr = err，
+				// err 为 nil 时会把 lastErr 清空，三次失败后仅报出
+				// "%!w(<nil>)"，真实状态码被丢掉、无法定位失败原因。
+				err = fmt.Errorf("HTTP 状态码 %d", status)
+			}
 		}
 		lastErr = err
 		if req.Context().Err() != nil {
